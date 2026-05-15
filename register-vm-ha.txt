@@ -1,0 +1,240 @@
+#!/bin/bash
+# =============================================================================
+# REGISTER VM FOR HIGH AVAILABILITY
+# Run on ANY cluster node after creating a VM with virt-manager
+# This makes the VM a Pacemaker resource so it:
+#   - Live-migrates automatically during planned maintenance
+#   - Restarts automatically on surviving node after crash
+# =============================================================================
+#
+# Usage:
+#   register-vm-ha <vm-name>
+#   register-vm-ha <vm-name> DRWPM08PIXX01   (prefer Node1)
+#   register-vm-ha <vm-name> DRWPM08PIXX02   (prefer Node2)
+#
+# Example:
+#   register-vm-ha win2022-dc1
+#   register-vm-ha ubuntu-app-server DRWPM08PIXX02
+#
+# =============================================================================
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+VM_NAME="${1:-}"
+PREFERRED_NODE="${2:-}"
+VM_CONFIG_DIR="/var/lib/libvirt/images/vm-configs"
+PEER_NODE=""
+PEER_IP=""
+
+
+# Detect environment (DR or PROD) and set node/IPs accordingly
+THIS_NODE=$(hostname -s)
+if [[ "${THIS_NODE}" =~ ^DRWPM08PIXX0[12]$ ]]; then
+    # DR environment
+    if [ "${THIS_NODE}" == "DRWPM08PIXX01" ]; then
+        PEER_NODE="DRWPM08PIXX02"
+        PEER_IP="192.168.131.124"
+    else
+        PEER_NODE="DRWPM08PIXX01"
+        PEER_IP="192.168.131.123"
+    fi
+elif [[ "${THIS_NODE}" =~ ^HOSPM08PIXX0[12]$ ]]; then
+    # PROD environment
+    if [ "${THIS_NODE}" == "HOSPM08PIXX01" ]; then
+        PEER_NODE="HOSPM08PIXX02"
+        PEER_IP="192.168.231.124"
+    else
+        PEER_NODE="HOSPM08PIXX01"
+        PEER_IP="192.168.231.123"
+    fi
+else
+    log_error "Unknown environment or node name: ${THIS_NODE}"
+    exit 1
+fi
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+if [ -z "${VM_NAME}" ]; then
+    echo ""
+    echo -e "${BLUE}Usage: bash $0 <vm-name> [preferred-node]${NC}"
+    echo ""
+    echo "Available VMs (not yet HA-registered):"
+    echo ""
+
+    # List all VMs and check which are already Pacemaker resources
+    ALL_VMS=$(virsh list --all --name 2>/dev/null | grep -v "^$")
+    HA_VMS=$(crm resource status 2>/dev/null | grep "VirtualDomain" | awk -F'[()]' '{print $1}' | sed 's/vm-ha-//' | tr -d ' ' || true)
+
+    if [ -z "${ALL_VMS}" ]; then
+        echo "  (no VMs found - create one with virt-manager first)"
+    else
+        for VM in ${ALL_VMS}; do
+            if echo "${HA_VMS}" | grep -q "^${VM}$" 2>/dev/null; then
+                echo -e "  ${GREEN}✓ ${VM}${NC} (already HA-registered)"
+            else
+                echo -e "  ${RED}✗ ${VM}${NC} (NOT HA-registered - needs registration!)"
+            fi
+        done
+    fi
+    echo ""
+    exit 1
+fi
+
+# Check VM exists
+if ! virsh dominfo "${VM_NAME}" &>/dev/null; then
+    log_error "VM '${VM_NAME}' not found!"
+    log_error "Available VMs:"
+    virsh list --all
+    exit 1
+fi
+
+# Check cluster is running
+if ! crm status &>/dev/null; then
+    log_error "Cluster not running! Start cluster first."
+    exit 1
+fi
+
+# Validate preferred node if given
+if [ -n "${PREFERRED_NODE}" ]; then
+    VALID_NODES=$(crm_node -l 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    if ! echo "${VALID_NODES}" | grep -qw "${PREFERRED_NODE}"; then
+        log_error "Node '${PREFERRED_NODE}' is not a member of this cluster."
+        log_error "Valid nodes: ${VALID_NODES}"
+        exit 1
+    fi
+fi
+
+# Check if already registered
+if crm resource status "vm-ha-${VM_NAME}" &>/dev/null; then
+    log_warn "VM '${VM_NAME}' is already registered as Pacemaker resource 'vm-ha-${VM_NAME}'"
+    crm resource status "vm-ha-${VM_NAME}"
+    exit 0
+fi
+
+# =============================================================================
+# STEP 1: SAVE VM XML TO SHARED STORAGE
+# =============================================================================
+log_info "Step 1: Saving VM config to shared storage..."
+
+mkdir -p "${VM_CONFIG_DIR}"
+
+# Dump VM XML to shared storage (both nodes can access /data via OCFS2)
+virsh dumpxml "${VM_NAME}" > "${VM_CONFIG_DIR}/${VM_NAME}.xml"
+log_info "VM XML saved to ${VM_CONFIG_DIR}/${VM_NAME}.xml ✓"
+
+# Verify disk images are on shared storage
+log_info "Step 2: Verifying VM disks are on shared storage..."
+DISK_PATHS=$(virsh domblklist "${VM_NAME}" 2>/dev/null | awk 'NR>2 && $2 != "-" && $2 != "" {print $2}')
+
+ALL_SHARED=true
+for DISK in ${DISK_PATHS}; do
+    if echo "${DISK}" | grep -qE "^/var/lib/libvirt/images/|^/data/"; then
+        log_info "  ✓ ${DISK} (on shared storage)"
+    else
+        log_error "  ✗ ${DISK} (NOT on shared storage!)"
+        log_error "    VM disks MUST be on /var/lib/libvirt/images/ or /data/"
+        log_error "    Move the disk first, then re-register."
+        ALL_SHARED=false
+    fi
+done
+
+if ! ${ALL_SHARED}; then
+    log_error "Cannot register VM - disks not on shared storage!"
+    rm -f "${VM_CONFIG_DIR}/${VM_NAME}.xml"
+    exit 1
+fi
+
+# =============================================================================
+# STEP 3: REGISTER VM AS PACEMAKER RESOURCE
+# =============================================================================
+log_info "Step 3: Registering VM as Pacemaker HA resource..."
+
+# Create the VirtualDomain resource
+crm configure primitive "vm-ha-${VM_NAME}" ocf:heartbeat:VirtualDomain \
+    params \
+        config="${VM_CONFIG_DIR}/${VM_NAME}.xml" \
+        hypervisor="qemu:///system" \
+        migration_transport="tcp" \
+        migration_network_suffix="" \
+    op start timeout="120s" \
+    op stop timeout="120s" \
+    op monitor interval="30s" timeout="60s" \
+    op migrate_from timeout="600s" \
+    op migrate_to timeout="600s" \
+    meta allow-migrate="true" \
+        target-role="Started" \
+        resource-stickiness="100" \
+        migration-threshold="3" \
+        failure-timeout="300s"
+
+log_info "Pacemaker resource 'vm-ha-${VM_NAME}' created ✓"
+
+# =============================================================================
+# STEP 4: SET ORDERING CONSTRAINTS
+# =============================================================================
+log_info "Step 4: Setting ordering constraints..."
+
+
+# VM must start AFTER libvirtd and OCFS2 filesystems (correct Pacemaker syntax)
+crm configure order order-fs-before-${VM_NAME} Mandatory: clone-fs-vm-storage:start vm-ha-${VM_NAME}:start
+crm configure order order-libvirt-before-${VM_NAME} Mandatory: clone-libvirtd:start vm-ha-${VM_NAME}:start
+
+log_info "Ordering constraints set ✓"
+
+# =============================================================================
+# STEP 5: SET PREFERRED NODE (OPTIONAL)
+# =============================================================================
+if [ -n "${PREFERRED_NODE}" ]; then
+    log_info "Step 5: Setting preferred node to ${PREFERRED_NODE}..."
+    crm configure location "loc-prefer-${VM_NAME}" "vm-ha-${VM_NAME}" \
+        100: "${PREFERRED_NODE}"
+    log_info "VM will prefer to run on ${PREFERRED_NODE} ✓"
+else
+    log_info "Step 5: No preferred node set (VM will run on either node)"
+fi
+
+# =============================================================================
+# STEP 6: VERIFY
+# =============================================================================
+log_info "Step 6: Waiting for resource to start..."
+sleep 15
+
+log_info "VM HA Resource Status:"
+crm resource status "vm-ha-${VM_NAME}" 2>/dev/null || true
+echo ""
+log_info "VM is running on:"
+crm resource locate "vm-ha-${VM_NAME}" 2>/dev/null || true
+
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║  VM '${VM_NAME}' REGISTERED FOR HIGH AVAILABILITY          ║${NC}"
+echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║  Resource name:  vm-ha-${VM_NAME}                          ║${NC}"
+echo -e "${GREEN}║  Config:         ${VM_CONFIG_DIR}/${VM_NAME}.xml           ║${NC}"
+echo -e "${GREEN}║                                                            ║${NC}"
+echo -e "${GREEN}║  PLANNED MAINTENANCE:                                      ║${NC}"
+echo -e "${GREEN}║    → VM auto live-migrates (ZERO downtime)                 ║${NC}"
+echo -e "${GREEN}║                                                            ║${NC}"
+echo -e "${GREEN}║  UNEXPECTED CRASH:                                         ║${NC}"
+echo -e "${GREEN}║    → VM auto-restarts on surviving node (~30-60s)          ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo "Commands:"
+echo "  Check status:    crm resource status vm-ha-${VM_NAME}"
+echo "  Migrate manually: crm resource migrate vm-ha-${VM_NAME} ${PEER_NODE}"
+echo "  Un-migrate:      crm resource unmigrate vm-ha-${VM_NAME}"
+echo "  Remove HA:       unregister-vm-ha ${VM_NAME}"
