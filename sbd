@@ -1,0 +1,28 @@
+#on both node
+modprobe softdog
+
+echo "softdog" > /etc/modules-load.d/watchdog.conf
+
+systemctl enable --now wd_keepalive
+
+systemctl restart sbd
+
+#1st node 
+wipefs -a /dev/mapper/mpatha
+
+sbd -d /dev/mapper/mpatha create
+
+sbd -d /dev/mapper/mpatha dump
+
+# Now this parameter will succeed because the watchdog actually exists!
+crm configure property have-watchdog=true
+
+# Register the primitive
+crm configure primitive stonith-sbd stonith:fence_sbd \
+        params sbd_device="/dev/mapper/mpatha" \
+        op monitor interval=30s timeout=20s
+
+# Commit your multi-stage topology hierarchy
+crm configure fencing-topology \
+        HOSPM08PIXX01: stonith-node2-redfish,stonith-sbd \
+        HOSPM08PIXX02: stonith-node1-redfish,stonith-sbd
